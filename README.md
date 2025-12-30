@@ -1,4 +1,4 @@
-# 🏁 RaceMaster Bot v1.0.0
+# 🏁 RaceMaster Bot v1.1.0
 
 > **Windows users:** use `setup_windows.bat`  
 > **Linux / VPS users:** use `setup_vps.sh`
@@ -177,3 +177,16 @@ MIT License — see `LICENSE` file
 
 Enjoy racing 🏁  
 Built for racers, not spreadsheets.
+
+## Changelog
+
+### v1.1.0
+- Added `/randomet` command for random ET drawings
+- Uses cryptographically secure randomness
+- Prevents duplicate ET results for 60 minutes per range
+- Clean race-friendly output formatting
+
+### v1.0.0
+- Initial release
+- Drag racing ladder system
+
