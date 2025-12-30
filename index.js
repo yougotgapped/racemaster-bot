@@ -5,8 +5,9 @@
  * See LICENSE file in the project root for full license information.
  */
 
-
 require("dotenv").config();
+const crypto = require("crypto"); // ✅ NEW: better RNG + unique draws
+
 const {
   Client,
   GatewayIntentBits,
@@ -43,6 +44,83 @@ if (!TOKEN || !CLIENT_ID || !GUILD_ID || !LADDER_CHANNEL_ID || !RACE_DIRECTOR_RO
  * old buttons from old messages won't work until you run /pair again (normal).
  */
 const ladders = new Map(); // key: ladderMessageId, value: state
+
+// ✅ NEW: Keep random ET results from repeating for 60 minutes (per server + range)
+const randomHistory = new Map(); 
+// key: `${guildId}:${minInt}:${maxInt}:2` -> Map(valueString -> timestampMs)
+const RANDOM_TTL_MS = 60 * 60 * 1000; // 60 minutes
+
+function purgeOldRandoms(bucket) {
+  const now = Date.now();
+  for (const [val, ts] of bucket.entries()) {
+    if (now - ts > RANDOM_TTL_MS) bucket.delete(val);
+  }
+}
+
+/**
+ * ✅ NEW: crypto RNG + no-repeat within 60 minutes (2 decimals)
+ * Works in .01 steps so values are clean ETs like 4.75 (never 4.747)
+ */
+function randomETNoRepeat({ guildId, min, max }) {
+  const precision = 2;
+  const scale = 10 ** precision; // 100
+
+  const lo = Math.min(min, max);
+  const hi = Math.max(min, max);
+
+  const minInt = Math.round(lo * scale);
+  const maxInt = Math.round(hi * scale);
+
+  if (maxInt < minInt) throw new Error("Invalid range.");
+
+  const totalPossible = maxInt - minInt + 1; // inclusive
+  const key = `${guildId || "noguild"}:${minInt}:${maxInt}:${precision}`;
+
+  let bucket = randomHistory.get(key);
+  if (!bucket) {
+    bucket = new Map();
+    randomHistory.set(key, bucket);
+  }
+
+  // Purge entries older than 60 minutes
+  purgeOldRandoms(bucket);
+
+  // If we've used all possible values within 60 minutes, we cannot avoid duplicates
+  if (bucket.size >= totalPossible) {
+    return {
+      ok: false,
+      reason: "No unique values left in the last 60 minutes for this range at 2 decimals.",
+      totalPossible,
+      lo: (minInt / scale).toFixed(2),
+      hi: (maxInt / scale).toFixed(2),
+    };
+  }
+
+  // Try to find a unique value (you said ~10 pulls at a time, so this is plenty)
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const n = crypto.randomInt(minInt, maxInt + 1); // inclusive
+    const val = (n / scale).toFixed(2);
+    if (!bucket.has(val)) {
+      bucket.set(val, Date.now());
+      return {
+        ok: true,
+        value: val,
+        totalPossible,
+        lo: (minInt / scale).toFixed(2),
+        hi: (maxInt / scale).toFixed(2),
+      };
+    }
+  }
+
+  // Very unlikely unless the range is nearly exhausted
+  return {
+    ok: false,
+    reason: "Range is nearly exhausted (too many recent values). Try again in a bit.",
+    totalPossible,
+    lo: (minInt / scale).toFixed(2),
+    hi: (maxInt / scale).toFixed(2),
+  };
+}
 
 /** Fisher-Yates shuffle */
 function shuffle(arr) {
@@ -281,6 +359,19 @@ async function registerCommands() {
       .setDescription("Reset the ladder in the ladder channel.")
       .setDefaultMemberPermissions(PermissionFlagsBits.ManageEvents)
       .toJSON(),
+
+    // ✅ /randomet min max
+    new SlashCommandBuilder()
+      .setName("randomet")
+      .setDescription("Generate a random ET between two ETs (ex: 6.70 to 7.50).")
+      .addNumberOption((opt) =>
+        opt.setName("min").setDescription("Minimum ET (ex: 4.60)").setRequired(true)
+      )
+      .addNumberOption((opt) =>
+        opt.setName("max").setDescription("Maximum ET (ex: 5.00)").setRequired(true)
+      )
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageEvents)
+      .toJSON(),
   ];
 
   const rest = new REST({ version: "10" }).setToken(TOKEN);
@@ -295,6 +386,59 @@ client.once("ready", () => console.log(`✅ Logged in as ${client.user.tag}`));
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
+      // ✅ /randomet allowed in ANY channel
+      if (interaction.commandName === "randomet") {
+        if (!isAuthorized(interaction)) {
+          return interaction.reply({
+            content: "❌ Only Race Directors/Admins can use this command.",
+            ephemeral: true,
+          });
+        }
+
+        const min = interaction.options.getNumber("min", true);
+        const max = interaction.options.getNumber("max", true);
+
+        if (
+          typeof min !== "number" ||
+          typeof max !== "number" ||
+          Number.isNaN(min) ||
+          Number.isNaN(max)
+        ) {
+          return interaction.reply({ content: "❌ Invalid numbers.", ephemeral: true });
+        }
+
+        if (min === max) {
+          return interaction.reply({
+            content: `🎯 Random ET: **${min.toFixed(2)}** (min and max were the same)`,
+            ephemeral: false,
+          });
+        }
+
+        const res = randomETNoRepeat({
+          guildId: interaction.guildId || "noguild",
+          min,
+          max,
+        });
+
+        if (!res.ok) {
+          return interaction.reply({
+            content:
+              `❌ ${res.reason}\n` +
+              `Range **${res.lo}–${res.hi}** has **${res.totalPossible}** possible unique values at 2 decimals.\n` +
+              `Try again later (after 60 minutes) or widen the range.`,
+            ephemeral: true,
+          });
+        }
+
+        return interaction.reply({
+  content: `🎲 Random ET Drawing ${res.lo} - ${res.hi} → Results: **${res.value}**`,
+  ephemeral: false,
+});
+
+
+      }
+
+      // ✅ Ladder-only commands below
       if (!isLadderChannel(interaction)) {
         return interaction.reply({
           content: "❌ Use ladder commands in the ladder channel only.",
@@ -351,7 +495,6 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (interaction.commandName === "reset_ladder") {
-        // wipe all active ladders (simple + reliable)
         ladders.clear();
         return interaction.reply("🧹 Ladder reset.");
       }
@@ -372,7 +515,6 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
-      // ✅ Get state by the MESSAGE ID that owns the buttons
       const state = ladders.get(interaction.message.id);
       if (!state) {
         return interaction.reply({
@@ -407,7 +549,6 @@ client.on("interactionCreate", async (interaction) => {
 
         match.winner = side === "a" ? match.a : match.b;
 
-        // ✅ NEW: If that winner ends the event, finalize immediately
         tryFinalizeEvent(state);
 
         return interaction.update({
