@@ -13,9 +13,12 @@ It creates randomized race ladders, lets race directors select winners using but
 - Button-based winner selection
 - Automatic round advancement
 - Role-based race director controls
+- Random ET drawings (`/randomet`)
+- Cryptographically secure ET generation with no recent duplicates
 - Optional ladder-channel enforcement
 - Simple `.env` configuration
 - Windows & Linux/VPS support
+
 
 ---
 
