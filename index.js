@@ -7,6 +7,8 @@
 
 require("dotenv").config();
 const crypto = require("crypto"); // ✅ NEW: better RNG + unique draws
+const fs = require("fs");
+const path = require("path");
 
 const {
   Client,
@@ -18,6 +20,7 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  EmbedBuilder,
 } = require("discord.js");
 
 const TOKEN = process.env.DISCORD_TOKEN;
@@ -26,6 +29,14 @@ const GUILD_ID = process.env.GUILD_ID;
 
 const LADDER_CHANNEL_ID = process.env.LADDER_CHANNEL_ID;
 const RACE_DIRECTOR_ROLE_ID = process.env.RACE_DIRECTOR_ROLE_ID;
+
+// === TOP 10 LEADERBOARD (optional) ===
+const TOP10_APPROVAL_CHANNEL_ID = process.env.TOP10_APPROVAL_CHANNEL_ID;
+const TOP10_TRACK_CHANNEL_ID = process.env.TOP10_TRACK_CHANNEL_ID;
+const TOP10_STREET_CHANNEL_ID = process.env.TOP10_STREET_CHANNEL_ID;
+const TOP10_LEADERBOARD_CHANNEL_ID = process.env.TOP10_LEADERBOARD_CHANNEL_ID;
+const TOP10_ROLE_ID = process.env.TOP10_ROLE_ID;
+const TOP10_REQUIRE_PROOF = (process.env.TOP10_REQUIRE_PROOF || "true").toLowerCase() === "true";
 
 if (!TOKEN || !CLIENT_ID || !GUILD_ID || !LADDER_CHANNEL_ID || !RACE_DIRECTOR_ROLE_ID) {
   console.error(
@@ -120,6 +131,244 @@ function randomETNoRepeat({ guildId, min, max }) {
     lo: (minInt / scale).toFixed(2),
     hi: (maxInt / scale).toFixed(2),
   };
+}
+
+// ============================
+// TOP 10 LEADERBOARD MODULE
+// ============================
+const TOP10_DATA_DIR = path.join(__dirname, "data");
+const TOP10_DB_PATH = path.join(TOP10_DATA_DIR, "top10.json");
+const TOP10_PENDING_PATH = path.join(TOP10_DATA_DIR, "top10_pending.json");
+
+const TOP10_COOLDOWN_PATH = path.join(TOP10_DATA_DIR, "top10_cooldowns.json");
+const TOP10_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 hours per user per board
+
+function ensureTop10Env() {
+  const missing = [];
+  if (!TOP10_APPROVAL_CHANNEL_ID) missing.push("TOP10_APPROVAL_CHANNEL_ID");
+  if (!TOP10_LEADERBOARD_CHANNEL_ID) missing.push("TOP10_LEADERBOARD_CHANNEL_ID");
+  if (!TOP10_ROLE_ID) missing.push("TOP10_ROLE_ID");
+  return missing;
+}
+
+function top10Enabled() {
+  return ensureTop10Env().length === 0;
+}
+
+function ensureDirSync(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+function readJsonSafe(filePath, fallback) {
+  try {
+    if (!fs.existsSync(filePath)) return fallback;
+    const raw = fs.readFileSync(filePath, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJsonSafe(filePath, data) {
+  ensureDirSync(TOP10_DATA_DIR);
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf8");
+}
+
+function normalizeET(etStr) {
+  const s = String(etStr).trim();
+  const num = Number(s);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  return { display: s, value: num };
+}
+
+function normalizeMPH(mphStr) {
+  const s = String(mphStr).trim();
+  const num = Number(s);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  return { display: s, value: num };
+}
+
+function makeSlipId() {
+  return crypto.randomBytes(12).toString("hex");
+}
+
+function sortTop10(entries) {
+  // Lowest ET wins. MPH does NOT affect placement.
+  // If ET ties, keep the earlier-approved entry higher (stable/deterministic).
+  return entries.sort((a, b) => {
+    if (a.etValue !== b.etValue) return a.etValue - b.etValue;
+    const aT = Number.isFinite(a.approvedAt) ? a.approvedAt : 0;
+    const bT = Number.isFinite(b.approvedAt) ? b.approvedAt : 0;
+    if (aT !== bT) return aT - bT;
+    return String(a.userId).localeCompare(String(b.userId));
+  });
+}
+
+function getTop10DB() {
+  return readJsonSafe(TOP10_DB_PATH, {
+    track: [],
+    street: [],
+    // single leaderboard message id in TOP10_LEADERBOARD_CHANNEL_ID
+    messages: { leaderboard: null },
+  });
+}
+
+function setTop10DB(db) {
+  writeJsonSafe(TOP10_DB_PATH, db);
+}
+
+function getPendingDB() {
+  return readJsonSafe(TOP10_PENDING_PATH, { pending: {} });
+}
+
+function setPendingDB(pending) {
+  writeJsonSafe(TOP10_PENDING_PATH, pending);
+}
+
+
+function getCooldownDB() {
+  return readJsonSafe(TOP10_COOLDOWN_PATH, { cooldowns: {} });
+}
+
+function setCooldownDB(db) {
+  writeJsonSafe(TOP10_COOLDOWN_PATH, db);
+}
+
+function getCooldownKey(userId, type) {
+  return `${userId}:${type}`;
+}
+
+function nextAllowedAtMs(lastMs) {
+  return (Number.isFinite(lastMs) ? lastMs : 0) + TOP10_COOLDOWN_MS;
+}
+
+function formatTop10Lines(entries) {
+  if (!entries || entries.length === 0) return "_No entries yet. Use `/submitslip` to submit one._";
+  return entries
+    .map((e, idx) => {
+      const place = String(idx + 1).padStart(2, "0");
+      return `**#${place}** — <@${e.userId}> — **ET:** \`${e.etDisplay}\` — **MPH:** \`${e.mphDisplay}\``;
+    })
+    .join("\n");
+}
+
+function buildTop10LeaderboardEmbeds(db) {
+  const trackText = formatTop10Lines(db.track);
+  const streetText = formatTop10Lines(db.street);
+
+  // 🔥 Banner embed (shows at the very top)
+  const bannerEmbed = new EmbedBuilder()
+    .setImage("https://i.ibb.co/S4k6RFzJ/GGG.png");
+
+  // 🏁 Leaderboard embed (below banner)
+  const leaderboardEmbed = new EmbedBuilder()
+    .setTitle("🏆 DFWStreets Top 10 Leaderboard")
+    .addFields(
+      { name: "🏁 Small Tire Top 10 (Track)", value: trackText },
+      { name: "🏁 Small Tire Top 10 (Street) ", value: streetText }
+    )
+    .setFooter({ text: "RaceMaster Bot 2025 • Updated automatically once approved" })
+    .setTimestamp(Date.now());
+
+  return [bannerEmbed, leaderboardEmbed];
+}
+
+
+/**
+ * Single-channel leaderboard:
+ * - Posts ONE embed in TOP10_LEADERBOARD_CHANNEL_ID
+ * - Edits the same message on every update
+ */
+async function upsertLeaderboardMessage(client, guild, db) {
+  const channel = await client.channels.fetch(TOP10_LEADERBOARD_CHANNEL_ID).catch(() => null);
+  if (!channel) return;
+
+  // Migrate old schema if present
+  if (!db.messages || typeof db.messages !== "object") db.messages = {};
+  if (!("leaderboard" in db.messages)) db.messages.leaderboard = null;
+
+  const existingMsgId = db.messages.leaderboard || null;
+  const embeds = buildTop10LeaderboardEmbeds(db);
+
+  if (existingMsgId) {
+    const msg = await channel.messages.fetch(existingMsgId).catch(() => null);
+    if (msg) {
+      await msg.edit({ embeds, content: "" }).catch(() => {});
+      return;
+    }
+  }
+
+  const newMsg = await channel.send({ embeds }).catch(() => null);
+  if (newMsg) {
+    db.messages.leaderboard = newMsg.id;
+    setTop10DB(db);
+  }
+}
+
+async function syncTop10Role(guild) {
+  const db = getTop10DB();
+  const inTop10 = new Set([
+    ...db.track.map((e) => e.userId),
+    ...db.street.map((e) => e.userId),
+  ]);
+
+  const role = await guild.roles.fetch(TOP10_ROLE_ID).catch(() => null);
+  if (!role) return;
+
+  // Add role to members in top10
+  for (const userId of inTop10) {
+    const member = await guild.members.fetch(userId).catch(() => null);
+    if (member && !member.roles.cache.has(role.id)) {
+      await member.roles.add(role.id).catch(() => {});
+    }
+  }
+
+  // Remove role from members who have it but are no longer in top10
+  for (const [memberId, member] of role.members) {
+    if (!inTop10.has(memberId)) {
+      await member.roles.remove(role.id).catch(() => {});
+    }
+  }
+}
+
+async function insertApprovedEntry(type, entry) {
+  const db = getTop10DB();
+  const list = type === "track" ? db.track : db.street;
+
+  // Keep only one entry per user per board
+  const filtered = list.filter((e) => e.userId !== entry.userId);
+  filtered.push(entry);
+
+  sortTop10(filtered);
+  const trimmed = filtered.slice(0, 10);
+
+  if (type === "track") db.track = trimmed;
+  else db.street = trimmed;
+
+  setTop10DB(db);
+  return db;
+}
+
+function buildApprovalEmbed({ type, userId, etDisplay, mphDisplay, proofUrl }) {
+  const title = type === "track" ? "Slip Submission (Track)" : "Slip Submission (Street)";
+  const emb = new EmbedBuilder()
+    .setTitle(title)
+    .setDescription(`Submitted by <@${userId}>`)
+    .addFields(
+      { name: "ET", value: `\`${etDisplay}\``, inline: true },
+      { name: "MPH", value: `\`${mphDisplay}\``, inline: true }
+    )
+    .setTimestamp(Date.now());
+
+  if (proofUrl) emb.addFields({ name: "Proof", value: proofUrl });
+  return emb;
+}
+
+function buildApprovalButtons(slipId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`top10_approve:${slipId}`).setLabel("Approve").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`top10_deny:${slipId}`).setLabel("Deny").setStyle(ButtonStyle.Danger)
+  );
 }
 
 /** Fisher-Yates shuffle */
@@ -360,6 +609,14 @@ async function registerCommands() {
       .setDefaultMemberPermissions(PermissionFlagsBits.ManageEvents)
       .toJSON(),
 
+
+new SlashCommandBuilder()
+  .setName("reset_top10")
+  .setDescription("Reset/clear the Top 10 leaderboard (Track + Street).")
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageEvents)
+  .toJSON(),
+
+
     // ✅ /randomet min max
     new SlashCommandBuilder()
       .setName("randomet")
@@ -372,6 +629,35 @@ async function registerCommands() {
       )
       .setDefaultMemberPermissions(PermissionFlagsBits.ManageEvents)
       .toJSON(),
+
+
+    // ✅ NEW: /submitslip (Top 10 Leaderboard)
+    new SlashCommandBuilder()
+      .setName("submitslip")
+      .setDescription("Submit a Track/Street slip with proof for Top 10 approval.")
+      .addStringOption((opt) =>
+        opt
+          .setName("type")
+          .setDescription("Track or Street")
+          .setRequired(true)
+          .addChoices(
+            { name: "Track", value: "track" },
+            { name: "Street", value: "street" }
+          )
+      )
+      .addStringOption((opt) =>
+        opt.setName("et").setDescription("Your ET (example: 4.70)").setRequired(true)
+      )
+      .addStringOption((opt) =>
+        opt.setName("mph").setDescription("Your MPH (example: 152.3)").setRequired(true)
+      )
+      .addAttachmentOption((opt) =>
+        opt
+          .setName("proof")
+          .setDescription("Upload a clip/screenshot as proof")
+          .setRequired(TOP10_REQUIRE_PROOF)
+      )
+      .toJSON(),
   ];
 
   const rest = new REST({ version: "10" }).setToken(TOKEN);
@@ -379,9 +665,25 @@ async function registerCommands() {
   console.log("✅ Slash commands registered.");
 }
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 
 client.once("ready", () => console.log(`✅ Logged in as ${client.user.tag}`));
+// ============================
+// AUTO-DELETE CHAT IN TOP 10 CHANNEL
+// ============================
+// Deletes any non-bot message posted in TOP10_LEADERBOARD_CHANNEL_ID.
+// Note: Bot must have "Manage Messages" permission in that channel.
+client.on("messageCreate", async (message) => {
+  try {
+    if (!TOP10_LEADERBOARD_CHANNEL_ID) return;
+    if (message.channelId !== TOP10_LEADERBOARD_CHANNEL_ID) return;
+    if (message.author?.bot) return;
+
+    // Delete any user message to keep the channel clean (slash commands still work)
+    await message.delete().catch(() => {});
+  } catch {}
+});
+
 
 client.on("interactionCreate", async (interaction) => {
   try {
@@ -437,6 +739,155 @@ client.on("interactionCreate", async (interaction) => {
 
 
       }
+
+
+      // ✅ NEW: /submitslip (Top 10) allowed in ANY channel
+      if (interaction.commandName === "submitslip") {
+        const missing = ensureTop10Env();
+        if (missing.length) {
+          return interaction.reply({
+            content: `❌ Top 10 is not configured. Missing: \`${missing.join(", ")}\``,
+            ephemeral: true,
+          });
+        }
+
+        const type = interaction.options.getString("type", true); // track | street
+        const etRaw = interaction.options.getString("et", true);
+        const mphRaw = interaction.options.getString("mph", true);
+        const proof = interaction.options.getAttachment("proof", false);
+
+        const et = normalizeET(etRaw);
+        const mph = normalizeMPH(mphRaw);
+
+        if (!et) return interaction.reply({ content: "❌ Invalid ET. Example: `4.70`", ephemeral: true });
+        if (!mph) return interaction.reply({ content: "❌ Invalid MPH. Example: `152.3`", ephemeral: true });
+        if (TOP10_REQUIRE_PROOF && !proof) {
+          return interaction.reply({ content: "❌ Proof is required. Attach a clip/screenshot.", ephemeral: true });
+        }
+
+        // ✅ Cooldown: one APPROVED entry per user per board (track/street) every 24h
+        const cooldownDB = getCooldownDB();
+        const cdKey = getCooldownKey(interaction.user.id, type);
+        const last = cooldownDB.cooldowns?.[cdKey] || 0;
+        const allowAt = nextAllowedAtMs(last);
+        const now = Date.now();
+
+        if (last && now < allowAt) {
+          const unix = Math.ceil(allowAt / 1000);
+          return interaction.reply({
+            content: `⏳ You already submitted a **${type}** slip in the last 24 hours.
+You can submit again **<t:${unix}:R>**.`,
+            ephemeral: true,
+          });
+        }
+
+
+        
+        // ✅ Prevent spam: only one pending submission per user per board at a time
+        const pendingNow = getPendingDB();
+        const alreadyPending = Object.values(pendingNow.pending || {}).some(
+          (p) => p && p.userId === interaction.user.id && p.type === type
+        );
+        if (alreadyPending) {
+          return interaction.reply({
+            content: `⏳ You already have a **${type}** slip pending approval. Please wait for it to be approved/denied before submitting another.`,
+            ephemeral: true,
+          });
+        }
+
+const slipId = makeSlipId();
+        const proofUrl = proof?.url || null;
+
+        const pendingDB = getPendingDB();
+        pendingDB.pending[slipId] = {
+          slipId,
+          guildId: interaction.guildId,
+          userId: interaction.user.id,
+          type,
+          etDisplay: et.display,
+          etValue: et.value,
+          mphDisplay: mph.display,
+          mphValue: mph.value,
+          proofUrl,
+          submittedAt: Date.now(),
+        };
+        setPendingDB(pendingDB);
+
+        const approvalChannel = await interaction.client.channels.fetch(TOP10_APPROVAL_CHANNEL_ID).catch(() => null);
+        if (!approvalChannel) {
+          return interaction.reply({
+            content: "❌ Approval channel not found. Check TOP10_APPROVAL_CHANNEL_ID.",
+            ephemeral: true,
+          });
+        }
+
+        const embed = buildApprovalEmbed({
+          type,
+          userId: interaction.user.id,
+          etDisplay: et.display,
+          mphDisplay: mph.display,
+          proofUrl,
+        });
+
+        await approvalChannel.send({
+          content: `📥 New slip pending approval: \`${slipId}\``,
+          embeds: [embed],
+          components: [buildApprovalButtons(slipId)],
+        });
+
+        return interaction.reply({ content: "✅ Submitted! Your slip was sent for approval.", ephemeral: true });
+      }
+
+
+// ✅ /reset_top10 (Top 10 reset) allowed in ANY channel
+if (interaction.commandName === "reset_top10") {
+  const missing = ensureTop10Env();
+  if (missing.length) {
+    return interaction.reply({
+      content: `❌ Top 10 is not configured. Missing: \`${missing.join(", ")}\``,
+      ephemeral: true,
+    });
+  }
+
+  if (!isAuthorized(interaction)) {
+    return interaction.reply({
+      content: "❌ Only Race Directors/Admins can reset the Top 10 leaderboard.",
+      ephemeral: true,
+    });
+  }
+
+  // Clear DB + pending
+  const db = getTop10DB();
+  const oldMsgId = db?.messages?.leaderboard || null;
+
+  db.track = [];
+  db.street = [];
+  if (!db.messages || typeof db.messages !== "object") db.messages = {};
+  db.messages.leaderboard = null;
+  setTop10DB(db);
+
+  const pending = getPendingDB();
+  pending.pending = {};
+  setPendingDB(pending);
+
+  // Clear cooldowns so everyone can submit again immediately after a reset
+  setCooldownDB({ cooldowns: {} });
+
+  // Try to delete old message (optional; ignore errors)
+  try {
+    const ch = await interaction.client.channels.fetch(TOP10_LEADERBOARD_CHANNEL_ID).catch(() => null);
+    if (ch && oldMsgId) {
+      const msg = await ch.messages.fetch(oldMsgId).catch(() => null);
+      if (msg) await msg.delete().catch(() => {});
+    }
+  } catch {}
+
+  // Post fresh empty leaderboard + sync roles off
+  await upsertLeaderboardMessage(interaction.client, interaction.guild, db);
+  await syncTop10Role(interaction.guild);
+
+  return interaction.reply({ content: "✅ Top 10 leaderboard has been reset.", ephemeral: true });
+}
 
       // ✅ Ladder-only commands below
       if (!isLadderChannel(interaction)) {
@@ -501,6 +952,104 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.isButton()) {
+      // ==========================
+      // ✅ TOP 10 Approve / Deny Buttons (work in ANY channel)
+      // ==========================
+      if (
+        interaction.customId.startsWith("top10_approve:") ||
+        interaction.customId.startsWith("top10_deny:")
+      ) {
+        const missing = ensureTop10Env();
+        if (missing.length) {
+          return interaction.reply({
+            content: `❌ Top 10 is not configured. Missing: \`${missing.join(", ")}\``,
+            ephemeral: true,
+          });
+        }
+
+        // Permission: Race Directors/Admins only
+        if (!isAuthorized(interaction)) {
+          return interaction.reply({
+            content: "❌ Only Race Directors/Admins can approve/deny slips.",
+            ephemeral: true,
+          });
+        }
+
+        const [action, slipId] = interaction.customId.split(":");
+        const pendingDB = getPendingDB();
+        const slip = pendingDB.pending?.[slipId];
+
+        if (!slip) {
+          return interaction.reply({
+            content: "❌ This slip is no longer pending (or was already handled).",
+            ephemeral: true,
+          });
+        }
+
+        // DENY
+        if (action === "top10_deny") {
+          delete pendingDB.pending[slipId];
+          setPendingDB(pendingDB);
+
+          return interaction.update({
+            content: `❌ Denied by <@${interaction.user.id}> — \`${slipId}\``,
+            components: [],
+          });
+        }
+
+        // APPROVE
+        const approvedEntry = {
+          userId: slip.userId,
+          etDisplay: slip.etDisplay,
+          etValue: slip.etValue,
+          mphDisplay: slip.mphDisplay,
+          mphValue: slip.mphValue,
+          proofUrl: slip.proofUrl,
+          approvedAt: Date.now(),
+          approvedBy: interaction.user.id,
+        };
+
+        // Insert + sort + trim to top 10
+        const db = getTop10DB();
+        const list = slip.type === "track" ? db.track : db.street;
+
+        // remove previous entry by same user on that board
+        const next = list.filter((e) => e.userId !== approvedEntry.userId);
+        next.push(approvedEntry);
+        sortTop10(next);
+        const trimmed = next.slice(0, 10);
+
+        if (slip.type === "track") db.track = trimmed;
+        else db.street = trimmed;
+        setTop10DB(db);
+        // ✅ Start 24h cooldown on APPROVAL (per user per board)
+        const cooldownDB = getCooldownDB();
+        const cdKey = getCooldownKey(approvedEntry.userId, slip.type);
+        cooldownDB.cooldowns = cooldownDB.cooldowns || {};
+        cooldownDB.cooldowns[cdKey] = Date.now();
+        setCooldownDB(cooldownDB);
+
+
+
+        // clear pending
+        delete pendingDB.pending[slipId];
+        setPendingDB(pendingDB);
+
+        // update approval message
+        await interaction.update({
+          content: `✅ Approved by <@${interaction.user.id}> — \`${slipId}\``,
+          components: [],
+        });
+
+        // update boards
+        await upsertLeaderboardMessage(interaction.client, interaction.guild, db);
+
+        // sync Top 10 role
+        await syncTop10Role(interaction.guild);
+
+        return;
+      }
+
       if (!isLadderChannel(interaction)) {
         return interaction.reply({
           content: "❌ Ladder buttons only work in the ladder channel.",
