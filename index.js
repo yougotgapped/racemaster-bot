@@ -192,6 +192,23 @@ function makeSlipId() {
   return crypto.randomBytes(12).toString("hex");
 }
 
+async function resolveUserDisplayName(client, guild, userId) {
+  try {
+    const member = guild ? await guild.members.fetch(userId).catch(() => null) : null;
+    if (member?.displayName) return member.displayName;
+  } catch {}
+
+  try {
+    const user = await client.users.fetch(userId).catch(() => null);
+    if (!user) return null;
+    return user.globalName || user.username || null;
+  } catch {
+    return null;
+  }
+}
+
+
+
 function sortTop10(entries) {
   // Lowest ET wins. MPH does NOT affect placement.
   // If ET ties, keep the earlier-approved entry higher (stable/deterministic).
@@ -243,11 +260,15 @@ function nextAllowedAtMs(lastMs) {
 }
 
 function formatTop10Lines(entries) {
-  if (!entries || entries.length === 0) return "_No entries yet. Use `/submitslip` to submit one._";
+  if (!entries || entries.length === 0) {
+    return "_No entries yet. Use `/submitslip` to submit one._";
+  }
+
   return entries
     .map((e, idx) => {
       const place = String(idx + 1).padStart(2, "0");
-      return `**#${place}** — <@${e.userId}> — **ET:** \`${e.etDisplay}\` — **MPH:** \`${e.mphDisplay}\``;
+      const name = e.userName || "Unknown Racer";
+      return `**#${place}** — **${name}** — **ET:** \`${e.etDisplay}\` — **MPH:** \`${e.mphDisplay}\``;
     })
     .join("\n");
 }
@@ -998,8 +1019,10 @@ if (interaction.commandName === "reset_top10") {
         }
 
         // APPROVE
+        const resolvedName = await resolveUserDisplayName(interaction.client, interaction.guild, slip.userId);
         const approvedEntry = {
           userId: slip.userId,
+          userName: resolvedName,
           etDisplay: slip.etDisplay,
           etValue: slip.etValue,
           mphDisplay: slip.mphDisplay,
