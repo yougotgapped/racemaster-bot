@@ -1,115 +1,67 @@
 @echo off
-setlocal EnableExtensions
+setlocal ENABLEDELAYEDEXPANSION
 
-echo.
 echo ==========================================
-echo   Race Master Bot V1.0.0 - Windows Setup
+echo   Race Master Bot V1.2.0 - Windows Setup
 echo      Created By: YouGotGapped
 echo          Discord: gapp3d_
 echo ==========================================
 echo.
 
-REM Move to the folder this script is in
-cd /d "%~dp0"
+:: Prompt for required values
+set /p DISCORD_TOKEN=Enter DISCORD BOT TOKEN:
+set /p CLIENT_ID=Enter CLIENT ID (Application ID):
+set /p GUILD_ID=Enter GUILD ID (Server ID):
+set /p LADDER_CHANNEL_ID=Enter LADDER CHANNEL ID:
+set /p RACE_DIRECTOR_ROLE_ID=Enter RACE DIRECTOR ROLE ID:
 
-REM If .env already exists, warn
-if exist ".env" (
-  echo [!] A .env file already exists.
-  choice /M "Overwrite it"
-  if errorlevel 2 (
-    echo Cancelled. Keeping existing .env
-    goto :EOF
-  )
-)
+:: Ladder channel enforcement
+set /p REQUIRE_LADDER_CHANNEL=Require ladder channel only? (true/false) [true]:
+if "%REQUIRE_LADDER_CHANNEL%"=="" set REQUIRE_LADDER_CHANNEL=true
 
-echo Enter your Discord Bot settings:
-echo (Tip: Right-click to paste in CMD)
+echo.
+echo === TOP 10 LEADERBOARD SETUP ===
 echo.
 
-set "DISCORD_TOKEN="
-set /p DISCORD_TOKEN=DISCORD_TOKEN (Bot Token): 
+set /p TOP10_APPROVAL_CHANNEL_ID=Enter TOP 10 APPROVAL CHANNEL ID:
+set /p TOP10_LEADERBOARD_CHANNEL_ID=Enter TOP 10 LEADERBOARD CHANNEL ID:
+set /p TOP10_ROLE_ID=Enter TOP 10 ROLE ID:
 
-set "CLIENT_ID="
-set /p CLIENT_ID=CLIENT_ID (Application ID): 
+set /p TOP10_REQUIRE_PROOF=Require proof upload? (true/false) [true]:
+if "%TOP10_REQUIRE_PROOF%"=="" set TOP10_REQUIRE_PROOF=true
 
-set "GUILD_ID="
-set /p GUILD_ID=GUILD_ID (Server ID - leave blank for global cmds): 
+echo.
+echo Writing .env file...
+echo.
 
-set "LADDER_CHANNEL_ID="
-set /p LADDER_CHANNEL_ID=LADDER_CHANNEL_ID: 
-
-set "RACE_DIRECTOR_ROLE_ID="
-set /p RACE_DIRECTOR_ROLE_ID=RACE_DIRECTOR_ROLE_ID: 
-
-set "REQUIRE_LADDER_CHANNEL=true"
-set /p REQUIRE_LADDER_CHANNEL=REQUIRE_LADDER_CHANNEL (true/false) [default true]: 
-if "%REQUIRE_LADDER_CHANNEL%"=="" set "REQUIRE_LADDER_CHANNEL=true"
-
-REM Basic validation (minimal)
-if "%DISCORD_TOKEN%"=="" goto :missing
-if "%CLIENT_ID%"=="" goto :missing
-if "%LADDER_CHANNEL_ID%"=="" goto :missing
-if "%RACE_DIRECTOR_ROLE_ID%"=="" goto :missing
-
-echo Writing .env ...
+:: Write .env
 (
-  echo DISCORD_TOKEN=%DISCORD_TOKEN%
-  echo CLIENT_ID=%CLIENT_ID%
-  echo GUILD_ID=%GUILD_ID%
-  echo LADDER_CHANNEL_ID=%LADDER_CHANNEL_ID%
-  echo RACE_DIRECTOR_ROLE_ID=%RACE_DIRECTOR_ROLE_ID%
-  echo REQUIRE_LADDER_CHANNEL=%REQUIRE_LADDER_CHANNEL%
+echo DISCORD_TOKEN=%DISCORD_TOKEN%
+echo CLIENT_ID=%CLIENT_ID%
+echo GUILD_ID=%GUILD_ID%
+echo LADDER_CHANNEL_ID=%LADDER_CHANNEL_ID%
+echo RACE_DIRECTOR_ROLE_ID=%RACE_DIRECTOR_ROLE_ID%
+echo REQUIRE_LADDER_CHANNEL=%REQUIRE_LADDER_CHANNEL%
+echo.
+echo # === TOP 10 LEADERBOARD ===
+echo TOP10_APPROVAL_CHANNEL_ID=%TOP10_APPROVAL_CHANNEL_ID%
+echo TOP10_LEADERBOARD_CHANNEL_ID=%TOP10_LEADERBOARD_CHANNEL_ID%
+echo TOP10_ROLE_ID=%TOP10_ROLE_ID%
+echo.
+echo # optional
+echo TOP10_REQUIRE_PROOF=%TOP10_REQUIRE_PROOF%
 ) > .env
-
-echo.
-echo ✅ Created .env
-
-echo.
-choice /M "Run npm install now"
-if errorlevel 2 goto :skipnpm
 
 echo.
 echo Installing dependencies...
 call npm install
-if errorlevel 1 (
-  echo ❌ npm install failed. Make sure Node.js is installed, then rerun setup.bat
-  goto :EOF
-)
-
-:skipnpm
-echo.
-choice /M "Start the bot now (npm start)"
-if errorlevel 2 goto :pm2ask
 
 echo.
-call npm start
-goto :EOF
-
-:pm2ask
+echo ==========================================
+echo   Setup complete!
+echo ==========================================
 echo.
-choice /M "Set up pm2 to run in background (optional)"
-if errorlevel 2 goto :EOF
-
+echo To start the bot:
+echo   npm start
 echo.
-echo Installing pm2 globally...
-call npm install -g pm2
-if errorlevel 1 (
-  echo ❌ Failed to install pm2. Try running CMD as Administrator.
-  goto :EOF
-)
-
-echo Starting bot with pm2...
-call pm2 start index.js --name race-master-bot
-call pm2 save
-
-echo.
-echo ✅ pm2 started the bot. To auto-start on reboot, run:
-echo    pm2 startup
-echo (Then run the command pm2 prints.)
-goto :EOF
-
-:missing
-echo.
-echo ❌ Missing required values. DISCORD_TOKEN, CLIENT_ID, LADDER_CHANNEL_ID, RACE_DIRECTOR_ROLE_ID are required.
-echo No .env written.
-exit /b 1
+pause
